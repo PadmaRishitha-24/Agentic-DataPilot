@@ -211,9 +211,16 @@ You should see `llama3.2:latest` listed.
 
 ## 7. How to Run
 
+> **💡 Windows PowerShell Tip:** You can either activate the virtual environment or run directly via `.\.venv\Scripts\`.
+
 ### Option 1: Run the Automated Pytest Suite
 Execute all 43 unit, integration, decision, verification, and reliability tests:
+
 ```powershell
+# Directly without script activation (Recommended):
+.\.venv\Scripts\pytest -v
+
+# Or after activating the venv:
 pytest -v
 ```
 **Expected Output:** `43 passed in ~16s`.
@@ -222,7 +229,12 @@ pytest -v
 
 ### Option 2: Run the Live Command-Line Demonstration
 Run the live end-to-end demonstration exercising both the benchmark core question and the zero-baseline edge case:
+
 ```powershell
+# Directly without script activation:
+.\.venv\Scripts\python.exe demo.py
+
+# Or after activating the venv:
 python demo.py
 ```
 This prints the complete execution trace, tool arguments, observations, and grounding verification scores in real time, and saves the markdown transcript to `demo_transcript.md`.
@@ -231,7 +243,12 @@ This prints the complete execution trace, tool arguments, observations, and grou
 
 ### Option 3: Launch the Streamlit Web Application
 Launch the rich interactive web interface:
+
 ```powershell
+# Directly without script activation:
+.\.venv\Scripts\streamlit.exe run app.py
+
+# Or after activating the venv:
 streamlit run app.py
 ```
 Open your browser to: **`http://localhost:8501`**.

@@ -6,6 +6,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DEFAULT_CSV_PATH = DATA_DIR / "sales_data.csv"
+SALES_DATA_PATH = DEFAULT_CSV_PATH
 
 # Local Ollama Settings (100% local, no cloud APIs)
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
