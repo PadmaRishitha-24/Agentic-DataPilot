@@ -30,7 +30,7 @@ class AgentDecision(BaseModel):
         default_factory=dict,
         description="Dictionary of arguments matching the tool schema.",
     )
-    answer: Optional[str] = Field(
+    answer: Optional[Any] = Field(
         default=None,
         description="The final grounded answer (required if action is 'final_answer').",
     )
@@ -47,8 +47,14 @@ class AgentDecision(BaseModel):
             if self.tool_args is None:
                 self.tool_args = {}
         elif self.action == "final_answer":
-            if not self.answer or not self.answer.strip():
+            if self.answer is None:
                 raise ValueError("answer text is required when action is 'final_answer'.")
+            if isinstance(self.answer, dict):
+                parts = [f"{str(k).replace('_', ' ').title()}: {v}" for k, v in self.answer.items()]
+                self.answer = ". ".join(parts)
+            elif not str(self.answer).strip():
+                raise ValueError("answer text is required when action is 'final_answer'.")
+            self.answer = str(self.answer).strip()
         elif self.action == "clarify":
             if not self.question or not self.question.strip():
                 raise ValueError("question text is required when action is 'clarify'.")

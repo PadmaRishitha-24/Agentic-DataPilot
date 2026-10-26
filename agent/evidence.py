@@ -161,10 +161,53 @@ class EvidenceRecord:
                 )
 
         elif tool_name == "get_sales_data":
-            for r in tool_result.get("records", []):
+            records = tool_result.get("records", [])
+            for r in records:
                 p = r.get("product")
                 if p:
                     self.known_products.add(p)
+            if records:
+                tot_rev = sum(float(r.get("revenue", 0.0)) for r in records)
+                start = tool_args.get("start_date", "all")
+                end = tool_args.get("end_date", "all")
+                period_key = f"{start}_to_{end}"
+                self.facts.append(
+                    GroundTruthFact(
+                        fact_type="total_revenue",
+                        subject=period_key,
+                        numeric_value=round(tot_rev, 2),
+                        source_tool="get_sales_data",
+                        details={"record_count": len(records)},
+                    )
+                )
+                prod_totals: Dict[str, float] = {}
+                for r in records:
+                    p = r.get("product")
+                    if p:
+                        prod_totals[p] = prod_totals.get(p, 0.0) + float(r.get("revenue", 0.0))
+                if prod_totals:
+                    top_p = max(prod_totals, key=prod_totals.get)
+                    self.top_products_by_period[period_key] = top_p
+                    self.facts.append(
+                        GroundTruthFact(
+                            fact_type="top_product",
+                            subject=period_key,
+                            string_value=top_p,
+                            numeric_value=round(prod_totals[top_p], 2),
+                            source_tool="get_sales_data",
+                            details={"revenue": round(prod_totals[top_p], 2)},
+                        )
+                    )
+                    for prod_name, p_rev in prod_totals.items():
+                        self.facts.append(
+                            GroundTruthFact(
+                                fact_type="product_revenue",
+                                subject=prod_name,
+                                numeric_value=round(p_rev, 2),
+                                source_tool="get_sales_data",
+                                details={"period": period_key},
+                            )
+                        )
 
     def get_summary_text(self) -> str:
         """Return formatted bullet points of established ground truth facts."""

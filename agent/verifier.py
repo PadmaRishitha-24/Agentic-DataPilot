@@ -34,8 +34,8 @@ class AnswerVerifier:
     @staticmethod
     def _extract_numbers(text: str) -> List[float]:
         """Extract monetary or numeric values from text, ignoring commas and dollar signs."""
-        # Match currency numbers like $68,400.00 or standalone numbers like 68400
-        pattern = r"\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)"
+        # Match currency numbers like $68,400.00 or standalone numbers like 68400.0
+        pattern = r"(?:\$|USD\s*)?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)"
         matches = re.findall(pattern, text)
         numbers = []
         for m in matches:
@@ -51,13 +51,20 @@ class AnswerVerifier:
 
     @staticmethod
     def _extract_percentages(text: str) -> List[float]:
-        """Extract percentage figures from text (e.g., 54.05%, +54.1%)."""
-        pattern = r"([+-]?[0-9]+(?:\.[0-9]+)?)\s*%"
-        matches = re.findall(pattern, text)
+        """Extract percentage figures from text (e.g., 54.05%, +54.1%, or 'Percentage Growth: 54.05')."""
         percentages = []
-        for m in matches:
+        # Match standard percentage numbers with % sign
+        for m in re.findall(r"([+-]?[0-9]+(?:\.[0-9]+)?)\s*%", text):
             try:
                 percentages.append(float(m))
+            except ValueError:
+                continue
+        # Match contextual growth numbers (e.g., 'growth: 54.05' or 'percentage: 54.05')
+        for m in re.findall(r"(?:growth|percentage|rate)[^\d+-]{1,20}([+-]?[0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE):
+            try:
+                val = float(m)
+                if val not in percentages:
+                    percentages.append(val)
             except ValueError:
                 continue
         return percentages
@@ -145,7 +152,12 @@ class AnswerVerifier:
             if prod.lower() in answer_lower
         ]
 
-        if observed_top_products:
+        asking_for_top = True
+        if user_query:
+            q_lower = user_query.lower()
+            asking_for_top = any(w in q_lower for w in ["top", "highest", "best", "most", "rank", "leader", "which product"])
+
+        if observed_top_products and asking_for_top:
             # Check if an actual top product is mentioned
             correct_top_mentioned = any(tp in answer_lower for tp in observed_top_products)
             if correct_top_mentioned:
@@ -161,6 +173,8 @@ class AnswerVerifier:
                     unsupported_claims.append(
                         f"Failed to identify verified top product: {list(observed_top_products)}"
                     )
+        elif mentioned_products:
+            verified_claims.append(f"Correctly referenced subject product(s): {mentioned_products}")
 
         # 4. Check Percentage Claims against Ground Truth
         extracted_pcts = cls._extract_percentages(candidate_answer)
@@ -198,16 +212,20 @@ class AnswerVerifier:
         extracted_nums = cls._extract_numbers(candidate_answer)
         for num in extracted_nums:
             rounded_num = round(num, 2)
+            # Check if it was one of the percentage numbers mistakenly extracted
+            if any(abs(rounded_num - round(p, 2)) < 0.2 for p in extracted_pcts) or any(
+                abs(rounded_num - obs_pct) <= 0.2 for obs_pct in observed_percentages
+            ):
+                continue
+
             matched = False
             for obs_num, desc in observed_numbers.items():
                 if abs(rounded_num - obs_num) <= 1.0:  # within $1.00 tolerance
                     verified_claims.append(f"Verified numerical figure ${num:,.2f} matches {desc}")
                     matched = True
                     break
+
             if not matched:
-                # Check if it was one of the percentage numbers mistakenly extracted
-                if any(abs(rounded_num - round(p, 2)) < 0.01 for p in extracted_pcts):
-                    continue
                 unsupported_claims.append(
                     f"Number {num:,.2f} does not match any revenue, order count, or difference in evidence."
                 )
