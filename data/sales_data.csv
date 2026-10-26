@@ -1,0 +1,27 @@
+order_id,date,product,category,units_sold,unit_price,revenue
+ORD-1001,2024-09-02,Quantum Laptop,Electronics,10,1200.0,12000.0
+ORD-1002,2024-09-05,CyberPhone Pro,Electronics,15,800.0,12000.0
+ORD-1003,2024-09-08,AeroDesk Ergonomic,Furniture,20,350.0,7000.0
+ORD-1004,2024-09-11,PulseWatch Ultra,Accessories,30,250.0,7500.0
+ORD-1005,2024-09-14,EchoPods Wireless,Accessories,40,150.0,6000.0
+ORD-1006,2024-09-17,Quantum Laptop,Electronics,12,1200.0,14400.0
+ORD-1007,2024-09-20,CyberPhone Pro,Electronics,20,800.0,16000.0
+ORD-1008,2024-09-23,AeroDesk Ergonomic,Furniture,15,350.0,5250.0
+ORD-1009,2024-09-26,PulseWatch Ultra,Accessories,25,250.0,6250.0
+ORD-1010,2024-09-29,EchoPods Wireless,Accessories,20,150.0,3000.0
+ORD-1011,2024-09-30,Quantum Laptop,Electronics,15,1200.0,18000.0
+ORD-1012,2024-10-02,Quantum Laptop,Electronics,18,1200.0,21600.0
+ORD-1013,2024-10-05,CyberPhone Pro,Electronics,22,800.0,17600.0
+ORD-1014,2024-10-08,AeroDesk Ergonomic,Furniture,25,350.0,8750.0
+ORD-1015,2024-10-11,PulseWatch Ultra,Accessories,35,250.0,8750.0
+ORD-1016,2024-10-14,EchoPods Wireless,Accessories,25,150.0,3750.0
+ORD-1017,2024-10-17,Quantum Laptop,Electronics,20,1200.0,24000.0
+ORD-1018,2024-10-20,CyberPhone Pro,Electronics,18,800.0,14400.0
+ORD-1019,2024-10-23,AeroDesk Ergonomic,Furniture,18,350.0,6300.0
+ORD-1020,2024-10-26,PulseWatch Ultra,Accessories,20,250.0,5000.0
+ORD-1021,2024-10-28,EchoPods Wireless,Accessories,15,150.0,2250.0
+ORD-1022,2024-10-29,Quantum Laptop,Electronics,19,1200.0,22800.0
+ORD-1023,2024-10-30,SolarKey Mechanical Keyboard,Accessories,40,100.0,4000.0
+ORD-1024,2024-11-02,Quantum Laptop,Electronics,10,1200.0,12000.0
+ORD-1025,2024-11-05,CyberPhone Pro,Electronics,12,800.0,9600.0
+ORD-1026,2024-11-08,PulseWatch Ultra,Accessories,15,250.0,3750.0
