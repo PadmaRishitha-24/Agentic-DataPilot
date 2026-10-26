@@ -183,3 +183,55 @@ You MUST respond ONLY with a valid JSON object matching this schema:
             data["tool_args"] = cleaned_args
 
         return AgentDecision.model_validate(data)
+
+    def get_corrected_answer(
+        self,
+        user_query: str,
+        candidate_answer: str,
+        feedback: str,
+    ) -> str:
+        """Request a bounded correction from Ollama based on verification feedback."""
+        prompt = f"""You are Agentic DataPilot.
+Your previous proposed answer failed verification because it contained numerical discrepancies or unsupported claims.
+
+ORIGINAL USER QUESTION:
+"{user_query}"
+
+PREVIOUS CANDIDATE ANSWER:
+"{candidate_answer}"
+
+VERIFICATION FEEDBACK & GROUND-TRUTH OBSERVATIONS:
+{feedback}
+
+INSTRUCTIONS:
+Revise your answer so that all product names, revenue numbers, and growth percentages strictly match the verified observations above.
+Do not introduce any numbers or claims not present in the verified observations.
+
+Respond with a JSON object:
+{{
+  "corrected_answer": "Your revised, fully grounded final answer.",
+  "rationale": "Brief 1-sentence note on the revision."
+}}
+"""
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+            "options": {"temperature": 0.1},
+        }
+
+        try:
+            resp = httpx.post(f"{self.base_url}/api/generate", json=payload, timeout=self.timeout)
+            if resp.status_code == 200:
+                raw_json = resp.json().get("response", "").strip()
+                data = json.loads(raw_json)
+                ans = data.get("corrected_answer") or data.get("answer")
+                if ans:
+                    return ans.strip()
+        except Exception:
+            pass
+
+        # Fallback if Ollama correction fails to output JSON: return previous answer for strict reverification
+        return candidate_answer
+

@@ -69,10 +69,17 @@ class AgentResponse(BaseModel):
     """Complete response returned by the agent upon terminating the loop."""
 
     query: str
-    status: Literal["completed", "clarification_needed", "max_iterations_reached", "error"]
+    status: Literal[
+        "completed",
+        "clarification_needed",
+        "max_iterations_reached",
+        "error",
+        "unverified",
+    ]
     final_answer: Optional[str] = None
     clarification_needed: Optional[str] = None
     steps: List[ExecutionStep] = Field(default_factory=list)
     total_iterations: int = 0
     verification: Optional[Dict[str, Any]] = None
+    evidence_summary: Optional[str] = None
     error_message: Optional[str] = None

@@ -33,6 +33,14 @@ class MockLLM:
             answer="Default mock final answer.",
         )
 
+    def get_corrected_answer(
+        self,
+        user_query: str,
+        candidate_answer: str,
+        feedback: str,
+    ) -> str:
+        return candidate_answer
+
 
 class TestAgentDecisionSchemas:
     """Tests for Pydantic schema validation."""
