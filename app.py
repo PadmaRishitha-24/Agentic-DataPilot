@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import importlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +16,12 @@ import pandas as pd
 import streamlit as st
 
 from config import DEFAULT_MODEL, OLLAMA_BASE_URL, SALES_DATA_PATH
+import agent.core as agent_core_mod
+import agent.evidence as agent_evidence_mod
+import agent.llm as agent_llm_mod
+import agent.schemas as agent_schemas_mod
+import agent.verifier as agent_verifier_mod
+import tools.sales_tools as sales_tools_pkg
 from agent.core import DataPilotAgent
 from agent.llm import OllamaLLM, OllamaUnavailableError
 from agent.schemas import AgentResponse
@@ -131,16 +138,24 @@ async def discover_tools_async() -> List[Dict[str, Any]]:
 
 async def execute_agent_query_async(query: str, max_iterations: int = 5) -> Tuple[AgentResponse, List[Dict[str, Any]]]:
     """Execute the DataPilot agent over genuine MCP client and local Ollama."""
+    # Ensure fresh execution against latest on-disk code
+    importlib.reload(sales_tools_pkg)
+    importlib.reload(agent_schemas_mod)
+    importlib.reload(agent_evidence_mod)
+    importlib.reload(agent_verifier_mod)
+    importlib.reload(agent_llm_mod)
+    importlib.reload(agent_core_mod)
+
     async with MCPClient() as client:
-        tools = await client.discover_tools()
-        llm = OllamaLLM()
-        agent = DataPilotAgent(
+        mcp_tools = await client.discover_tools()
+        llm = agent_llm_mod.OllamaLLM()
+        pilot_agent = agent_core_mod.DataPilotAgent(
             mcp_client=client,
             llm=llm,
             max_iterations=max_iterations,
         )
-        response = await agent.run_query(query, tools=tools)
-        return response, tools
+        response = await pilot_agent.run(query)
+        return response, mcp_tools
 
 
 # Check Ollama and Dataset Availability
@@ -296,7 +311,7 @@ if "last_response" in st.session_state:
         st.success(f"**Verified Answer:** {resp.final_answer}")
     elif resp.status == "unverified":
         st.warning(f"**Unverified Candidate Answer:** {resp.final_answer}")
-        st.caption("⚠️ The agent refused to present this candidate answer as authoritative because it could not be 100% verified against evidence.")
+        st.caption("⚠️ Grounding Protection Alert: The system refused to present this candidate answer as authoritative because it could not be 100% verified against tool evidence or requested metrics absent from the dataset. See verification breakdown below.")
     elif resp.status == "clarification_needed":
         st.info(f"**Clarification Requested:** {resp.clarification_needed}")
     else:

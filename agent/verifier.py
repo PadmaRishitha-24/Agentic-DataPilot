@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set
 from pydantic import BaseModel, Field
 
 from agent.evidence import EvidenceRecord
+from agent.schemas import extract_requested_product
 
 
 class VerificationResult(BaseModel):
@@ -33,18 +34,28 @@ class AnswerVerifier:
 
     @staticmethod
     def _extract_numbers(text: str) -> List[float]:
-        """Extract monetary or numeric values from text, ignoring commas and dollar signs."""
+        """Extract monetary or numeric values from text, ignoring commas, dollar signs, and list bullets."""
+        # Strip list enumeration prefixes like "1. ", "2. ", "1) ", or "#1"
+        sanitized = re.sub(r'(?:^|\n|\r)\s*\d+[\.\)]\s+', '\n', text)
+        sanitized = re.sub(r'(?:^|\s)#\d+\b', ' ', sanitized)
+        sanitized = re.sub(r'\b(?:rank|order|step|item|position)\s*#?\d+\b', ' ', sanitized, flags=re.IGNORECASE)
+
         # Match currency numbers like $68,400.00 or standalone numbers like 68400.0
         pattern = r"(?:\$|USD\s*)?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)"
-        matches = re.findall(pattern, text)
+        matches = re.findall(pattern, sanitized)
         numbers = []
         for m in matches:
-            cleaned = m.replace(",", "").strip()
+            cleaned = m.replace(",", "").rstrip(".").strip()
+            if not cleaned:
+                continue
             try:
                 val = float(cleaned)
-                # Ignore trivial numbers like 0, 1, 2, 2024 (years/dates)
-                if val not in [0.0, 1.0, 2.0, 2024.0, 2025.0, 2026.0]:
-                    numbers.append(val)
+                # Ignore trivial years and standalone small indices (0-10)
+                if val in [2024.0, 2025.0, 2026.0, 2023.0, 2022.0]:
+                    continue
+                if val in [float(i) for i in range(0, 11)]:
+                    continue
+                numbers.append(val)
             except ValueError:
                 continue
         return numbers
@@ -59,13 +70,16 @@ class AnswerVerifier:
                 percentages.append(float(m))
             except ValueError:
                 continue
-        # Match contextual growth numbers (e.g., 'growth: 54.05' or 'percentage: 54.05')
-        for m in re.findall(r"(?:growth|percentage|rate)[^\d+-]{1,20}([+-]?[0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE):
+        # Match contextual growth numbers (e.g., 'growth: 54.05' or 'growth rate: 54.05')
+        for m in re.finditer(r"\b(growth(?:\s+rate)?|percentage(?:\s+growth)?)\b[^\d+$%-]{1,20}([+-]?[0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE):
             try:
-                val = float(m)
+                matched_str = m.group(0)
+                if "$" in matched_str:
+                    continue
+                val = float(m.group(2))
                 if val not in percentages:
                     percentages.append(val)
-            except ValueError:
+            except (ValueError, IndexError):
                 continue
         return percentages
 
@@ -94,23 +108,49 @@ class AnswerVerifier:
                 missing_evidence=["No answer content provided."],
             )
 
-        # 1. Extract potential empirical claims
+        # 1. Harvest known products from evidence record, observations, and user query
+        all_known_products: Set[str] = set(evidence.known_products)
+        target_product = extract_requested_product(user_query)
+        if target_product:
+            all_known_products.add(target_product)
+
+        for f in evidence.facts:
+            if f.fact_type in ("top_product", "lowest_product") and f.string_value:
+                all_known_products.add(f.string_value)
+            elif f.fact_type == "product_revenue" and f.subject:
+                all_known_products.add(f.subject)
+        for obs in evidence.raw_observations:
+            res = obs.get("tool_result", {})
+            if res.get("top_product"):
+                all_known_products.add(res["top_product"])
+            if res.get("lowest_product"):
+                all_known_products.add(res["lowest_product"])
+            for item in res.get("product_rankings", []):
+                if item.get("product"):
+                    all_known_products.add(item["product"])
+
+        # Extract potential empirical claims
         extracted_nums = cls._extract_numbers(candidate_answer)
         extracted_pcts = cls._extract_percentages(candidate_answer)
         answer_lower = candidate_answer.lower()
         mentioned_products = [
-            prod for prod in evidence.known_products
+            prod for prod in all_known_products
             if prod.lower() in answer_lower
         ]
 
         # If answer contains no numerical figures, percentages, or product claims (e.g. greeting/help)
         if not extracted_nums and not extracted_pcts and not mentioned_products:
-            return VerificationResult(
-                is_verified=True,
-                confidence_score=1.0,
-                explanation="Answer contains no numerical or dataset-specific claims (conversational/informational response).",
-                verified_claims=["Conversational response with zero ungrounded claims."],
+            is_specific_data_query = bool(
+                target_product
+                or (user_query and any(w in user_query.lower() for w in ["total revenue", "profit margin", "rank all", "compare", "growth"]))
             )
+            if not is_specific_data_query:
+                return VerificationResult(
+                    is_verified=True,
+                    confidence_score=1.0,
+                    explanation="Answer contains no numerical or dataset-specific claims (conversational/informational response).",
+                    verified_claims=["Conversational response with zero ungrounded claims."],
+                )
 
         # 2. Check if any evidence was gathered to support the data claims
         if not evidence.facts and not evidence.raw_observations:
@@ -125,13 +165,17 @@ class AnswerVerifier:
         verified_claims: List[str] = []
         unsupported_claims: List[str] = []
         contradictions: List[str] = []
+        missing_evidence: List[str] = []
         recalculated: Dict[str, Any] = {}
 
-        # 2. Extract facts from evidence
         observed_numbers: Dict[float, str] = {}
         observed_percentages: Dict[float, str] = {}
         observed_top_products: Set[str] = set()
+        observed_lowest_products: Set[str] = set()
+        product_revenues: Dict[str, float] = {}
+        ranked_products: List[str] = []
 
+        # Harvest facts from evidence
         for f in evidence.facts:
             if f.numeric_value is not None:
                 if f.fact_type == "percentage_growth":
@@ -140,41 +184,499 @@ class AnswerVerifier:
                     )
                 else:
                     observed_numbers[round(f.numeric_value, 2)] = (
-                        f"{f.fact_type} for {f.subject} (${f.numeric_value:,.2f}) from {f.source_tool}"
+                        f"{f.fact_type} for {f.subject} ({f.numeric_value:,.2f}) from {f.source_tool}"
                     )
             if f.fact_type == "top_product" and f.string_value:
                 observed_top_products.add(f.string_value.lower())
+                if f.numeric_value is not None:
+                    product_revenues[f.string_value.lower()] = float(f.numeric_value)
+            if f.fact_type == "lowest_product" and f.string_value:
+                observed_lowest_products.add(f.string_value.lower())
+                if f.numeric_value is not None:
+                    product_revenues[f.string_value.lower()] = float(f.numeric_value)
+            if f.fact_type == "product_revenue" and f.numeric_value is not None:
+                product_revenues[f.subject.lower()] = float(f.numeric_value)
 
-        # 3. Check Product Identity & Top Product assertion
-        answer_lower = candidate_answer.lower()
+        # Extract product rankings and complete order from raw observations if present
+        for obs in evidence.raw_observations:
+            t_name = obs.get("tool_name")
+            res = obs.get("tool_result", {})
+            if t_name == "calculate_metrics":
+                if res.get("top_product"):
+                    observed_top_products.add(res["top_product"].lower())
+                if res.get("lowest_product"):
+                    observed_lowest_products.add(res["lowest_product"].lower())
+                if res.get("total_records") is not None:
+                    observed_numbers[round(float(res["total_records"]), 2)] = f"Total records ({res['total_records']}) from calculate_metrics"
+                if res.get("total_revenue") is not None:
+                    observed_numbers[round(float(res["total_revenue"]), 2)] = f"Total revenue (${res['total_revenue']:,.2f}) from calculate_metrics"
+                if res.get("total_units") is not None:
+                    observed_numbers[round(float(res["total_units"]), 2)] = f"Total units ({res['total_units']}) from calculate_metrics"
+                if res.get("top_product_revenue") is not None:
+                    observed_numbers[round(float(res["top_product_revenue"]), 2)] = f"Top product revenue (${res['top_product_revenue']:,.2f}) from calculate_metrics"
+                if res.get("lowest_product_revenue") is not None:
+                    observed_numbers[round(float(res["lowest_product_revenue"]), 2)] = f"Lowest product revenue (${res['lowest_product_revenue']:,.2f}) from calculate_metrics"
+                if res.get("product_rankings"):
+                    rankings = res.get("product_rankings", [])
+                    if not ranked_products:
+                        ranked_products = [
+                            item["product"].lower() for item in rankings if item.get("product")
+                        ]
+                    if not observed_top_products and rankings:
+                        observed_top_products.add(rankings[0]["product"].lower())
+                    if not observed_lowest_products and rankings:
+                        observed_lowest_products.add(rankings[-1]["product"].lower())
+                    for item in rankings:
+                        p_name = item.get("product")
+                        p_rev = item.get("total_revenue")
+                        if p_name and p_rev is not None:
+                            product_revenues[p_name.lower()] = float(p_rev)
+                            observed_numbers[round(float(p_rev), 2)] = f"Revenue for {p_name} (${float(p_rev):,.2f}) from calculate_metrics"
+                        if item.get("units_sold") is not None:
+                            observed_numbers[round(float(item["units_sold"]), 2)] = f"Units sold for {p_name} ({item['units_sold']}) from calculate_metrics"
+                        if item.get("order_count") is not None:
+                            observed_numbers[round(float(item["order_count"]), 2)] = f"Order count for {p_name} ({item['order_count']}) from calculate_metrics"
+            elif t_name == "get_sales_data":
+                if res.get("total_records") is not None:
+                    observed_numbers[round(float(res["total_records"]), 2)] = f"Total records ({res['total_records']}) from get_sales_data"
+                for r in res.get("records", []):
+                    if r.get("units_sold") is not None:
+                        observed_numbers[round(float(r["units_sold"]), 2)] = f"Units sold ({r['units_sold']}) from get_sales_data"
+                    if r.get("unit_price") is not None:
+                        observed_numbers[round(float(r["unit_price"]), 2)] = f"Unit price (${r['unit_price']}) from get_sales_data"
+                    if r.get("revenue") is not None:
+                        observed_numbers[round(float(r["revenue"]), 2)] = f"Revenue (${r['revenue']}) from get_sales_data"
+
+        # Fallback derivations from product_revenues if top/lowest/rankings not yet set
+        if product_revenues and not observed_top_products:
+            top_p = max(product_revenues, key=product_revenues.get)
+            observed_top_products.add(top_p)
+        if product_revenues and not observed_lowest_products:
+            low_p = min(product_revenues, key=product_revenues.get)
+            observed_lowest_products.add(low_p)
+        if product_revenues and not ranked_products:
+            sorted_prods = sorted(product_revenues.items(), key=lambda x: x[1], reverse=True)
+            ranked_products = [p[0] for p in sorted_prods]
+
+        # 3. Intent-Aware Product & Ranking Verification
+        q_lower = (user_query or "").lower().strip()
+        ans_lower = candidate_answer.lower()
         mentioned_products = [
-            prod for prod in evidence.known_products
-            if prod.lower() in answer_lower
+            prod for prod in all_known_products
+            if prod.lower() in ans_lower
         ]
+        q_prods = [p for p in all_known_products if p.lower() in q_lower]
 
-        asking_for_top = True
-        if user_query:
-            q_lower = user_query.lower()
-            asking_for_top = any(w in q_lower for w in ["top", "highest", "best", "most", "rank", "leader", "which product"])
+        # Query intent detection
+        q_asks_profit_or_cost = bool(
+            q_lower and re.search(r'\b(profit\s*margin|profit|margin|costs?|cogs|expenses?|net\s*income)\b', q_lower)
+        )
+        q_asks_rank_all = bool(
+            not q_asks_profit_or_cost and q_lower and (
+                any(phrase in q_lower for phrase in [
+                    "rank all", "ranking all", "rank the products", "rank products", "ranking of all",
+                    "show all products", "all products by", "each product", "all products ranked",
+                    "list all products", "product rankings", "order all products",
+                    "highest to lowest", "lowest to highest"
+                ]) or (
+                    any(w in q_lower for w in ["rank", "ranking", "rankings", "order"])
+                    and any(w in q_lower for w in ["all", "every", "each", "products"])
+                )
+            )
+        )
+        q_asks_lowest = bool(
+            not q_asks_profit_or_cost
+            and not q_asks_rank_all
+            and q_lower
+            and bool(re.search(r'\b(lowest|least|bottom|worst|smallest|minimum)\b', q_lower))
+        )
+        q_asks_top = bool(
+            not q_asks_profit_or_cost
+            and not q_asks_rank_all
+            and not q_asks_lowest
+            and q_lower
+            and bool(re.search(r'\b(top|highest|best|leader|first)\b|\bmost revenue\b|\bmaximum revenue\b|\bgreatest revenue\b|\brank\s*1\b|\b#1\b', q_lower))
+        )
+        q_asks_ranking = bool(
+            not q_asks_profit_or_cost
+            and not q_asks_rank_all
+            and not q_asks_lowest
+            and not q_asks_top
+            and q_lower
+            and any(w in q_lower for w in ["rank", "ranking", "rankings", "order", "ordered", "sorted"])
+        )
+        q_asks_specific = bool(
+            not q_asks_profit_or_cost
+            and not q_asks_rank_all
+            and (q_prods or target_product)
+            and not q_asks_lowest
+            and not q_asks_top
+            and not q_asks_ranking
+        )
+        q_asks_total = bool(
+            not q_asks_profit_or_cost
+            and not q_asks_rank_all
+            and q_lower
+            and not q_asks_specific
+            and not target_product
+            and any(
+                phrase in q_lower for phrase in [
+                    "total revenue", "total sales", "overall revenue", "overall sales",
+                    "revenue across all", "sales across all", "how much revenue", "how much was made",
+                    "what was the revenue", "what was the total", "across all"
+                ]
+            )
+            and not q_asks_lowest
+            and not q_asks_top
+        )
 
-        if observed_top_products and asking_for_top:
-            # Check if an actual top product is mentioned
-            correct_top_mentioned = any(tp in answer_lower for tp in observed_top_products)
-            if correct_top_mentioned:
-                matching_prods = [tp for tp in observed_top_products if tp in answer_lower]
-                verified_claims.append(f"Correctly identified top product: {matching_prods}")
+        # Candidate answer claims
+        ans_claims_lowest = any(w in ans_lower for w in ["lowest", "least revenue", "bottom product", "minimum revenue", "lowest-revenue", "least total revenue"])
+        ans_claims_top = any(w in ans_lower for w in ["highest", "top product", "top revenue", "highest-revenue", "best product", "most revenue", "maximum revenue", "rank 1", "#1"])
+
+        # Determine effective intent
+        if q_asks_profit_or_cost:
+            effective_intent = "profit_margin"
+        elif q_asks_rank_all:
+            effective_intent = "rank_all"
+        elif q_asks_lowest:
+            effective_intent = "lowest"
+        elif q_asks_top:
+            effective_intent = "top"
+        elif q_asks_ranking:
+            effective_intent = "ranking"
+        elif q_asks_specific or target_product:
+            effective_intent = "specific_product"
+        elif q_asks_total:
+            effective_intent = "total_revenue"
+        elif q_lower:
+            if q_prods or target_product:
+                effective_intent = "specific_product"
             else:
-                # Check if a different product was asserted
-                if mentioned_products:
-                    contradictions.append(
-                        f"Answer mentions product(s) {mentioned_products}, but actual top product in evidence is {list(observed_top_products)}."
-                    )
+                effective_intent = "general"
+        else:
+            # Query not supplied: inspect candidate answer assertions
+            if ans_claims_lowest and not ans_claims_top:
+                effective_intent = "lowest"
+            elif ans_claims_top and not ans_claims_lowest:
+                effective_intent = "top"
+            elif any(phrase in ans_lower for phrase in ["total revenue", "across all"]):
+                effective_intent = "total_revenue"
+            else:
+                effective_intent = "general"
+
+        # Apply intent-aware verification
+        if effective_intent == "profit_margin":
+            # 1. Answer must clearly disclose that profit margin/cost data is unavailable
+            ans_states_limitation = bool(
+                re.search(
+                    r'\b(cannot be (calculated|determined|computed|provided)|not (available|tracked|provided|included|recorded)|does not (contain|include|track|record|have)|no (profit|cost|expense|cogs) data)\b',
+                    ans_lower,
+                )
+            )
+            if ans_states_limitation:
+                verified_claims.append(
+                    "Correctly identified limitation: profit margin cannot be calculated because cost/expense/profit data is not tracked in the dataset."
+                )
+            else:
+                contradictions.append(
+                    "Answer fails to state that profit margin cannot be calculated due to missing cost or profit data in the dataset."
+                )
+
+            # 2. Rejection of hallucinated percentages
+            pct_profit_claim = re.search(
+                r'(\d+(?:\.\d+)?%?\s*(?:profit|margin)|(?:profit|margin)\s*(?:of|is|was|at)?\s*\d+(?:\.\d+)?%)',
+                ans_lower,
+            )
+            if pct_profit_claim or extracted_pcts:
+                contradictions.append(
+                    f"Answer asserts percentage figure(s) {extracted_pcts}% in the context of profit margin, "
+                    "which contradicts the dataset schema (sales data contains no cost or profit information)."
+                )
+
+            # 3. Reference to requested product
+            if q_prods:
+                matching_target = [p for p in q_prods if p.lower() in ans_lower]
+                if matching_target:
+                    verified_claims.append(f"Correctly referenced requested product: {[p.title() for p in matching_target]}")
                 else:
                     unsupported_claims.append(
-                        f"Failed to identify verified top product: {list(observed_top_products)}"
+                        f"Answer does not mention the requested product(s): {[p.title() for p in q_prods]}."
                     )
-        elif mentioned_products:
-            verified_claims.append(f"Correctly referenced subject product(s): {mentioned_products}")
+            elif mentioned_products:
+                verified_claims.append(f"Referenced product(s): {[p.title() for p in mentioned_products]}")
+
+            # 4. Check that irrelevant lowest rationale was not returned
+            if ans_claims_lowest and not any(w in q_lower for w in ["lowest", "least", "bottom"]):
+                contradictions.append(
+                    "Answer introduces an irrelevant lowest-revenue rationale not requested by the user."
+                )
+
+        elif effective_intent == "rank_all":
+            # 1. Determine requested direction
+            is_ascending = any(phrase in q_lower for phrase in ["lowest to highest", "least to most", "ascending", "bottom to top"])
+            direction_str = "ascending (lowest to highest)" if is_ascending else "descending (highest to lowest)"
+            expected_order = list(reversed(ranked_products)) if is_ascending else list(ranked_products)
+
+            # 2. Answer-Completeness Check: every product in evidence-supported ranking must be included
+            if ranked_products:
+                missing_from_ranking = [p for p in ranked_products if p not in ans_lower]
+                if missing_from_ranking:
+                    unsupported_claims.append(
+                        f"Answer fails completeness check: requested complete ranking of all {len(ranked_products)} products, "
+                        f"but answer is missing {len(missing_from_ranking)} product(s): {[p.title() for p in missing_from_ranking]}."
+                    )
+                    contradictions.append(
+                        f"Answer only provides an incomplete ranking ({len(mentioned_products)} of {len(ranked_products)} products) when a complete ranking of all {len(ranked_products)} products was requested."
+                    )
+                    missing_evidence.extend([f"Missing product from complete ranking: {p.title()}" for p in missing_from_ranking])
+
+                # Check revenue figures for each product in the complete ranking
+                missing_revenues = []
+                for p in ranked_products:
+                    exp_rev = product_revenues.get(p)
+                    if exp_rev is not None:
+                        if not any(abs(round(exp_rev, 2) - round(n, 2)) <= 1.0 for n in extracted_nums):
+                            missing_revenues.append((p.title(), exp_rev))
+                if missing_revenues:
+                    unsupported_claims.append(
+                        f"Answer fails completeness check: missing exact revenue figures for {len(missing_revenues)} product(s): "
+                        + ", ".join([f"{item[0]} (${item[1]:,.2f})" for item in missing_revenues])
+                    )
+                    missing_evidence.extend([f"Missing revenue figure for {item[0]} (${item[1]:,.2f})" for item in missing_revenues])
+
+            # 3. Order & Sequence Verification
+            if len(mentioned_products) >= 2 and ranked_products:
+                indices = []
+                for p in ranked_products:
+                    if p in ans_lower:
+                        indices.append((ans_lower.find(p), expected_order.index(p), p))
+                indices.sort(key=lambda x: x[0])  # order of appearance in answer text
+                actual_order = [x[1] for x in indices]
+                if actual_order != sorted(actual_order):
+                    contradictions.append(
+                        f"Product ranking order in answer ({[x[2].title() for x in indices]}) contradicts the requested {direction_str} order."
+                    )
+                else:
+                    verified_claims.append(
+                        f"Verified ranking order in answer matches requested {direction_str} order: {[x[2].title() for x in indices]}."
+                    )
+            elif not ranked_products and mentioned_products:
+                verified_claims.append(f"Referenced products: {mentioned_products}")
+
+        elif effective_intent == "lowest":
+            # Lowest-revenue verification: must match minimum revenue product
+            if ans_claims_top and not (observed_top_products and any(tp in ans_lower for tp in observed_top_products)):
+                contradictions.append(
+                    "Answer claims a product as highest/top revenue, contradicting the lowest-revenue intent."
+                )
+
+            if observed_lowest_products:
+                matching_lowest = [lp for lp in observed_lowest_products if lp in ans_lower]
+                if matching_lowest:
+                    verified_claims.append(f"Correctly identified lowest-revenue product: {matching_lowest}")
+                else:
+                    if mentioned_products:
+                        contradictions.append(
+                            f"Answer asserts product(s) {mentioned_products} as lowest-revenue product, but actual lowest-revenue product in evidence is {list(observed_lowest_products)}."
+                        )
+                    else:
+                        unsupported_claims.append(
+                            f"Failed to identify verified lowest-revenue product: {list(observed_lowest_products)}"
+                        )
+
+            # Check if top product was mistakenly presented as lowest
+            if observed_top_products and not any(lp in ans_lower for lp in observed_lowest_products):
+                matching_top = [tp for tp in observed_top_products if tp in ans_lower]
+                if matching_top:
+                    contradictions.append(
+                        f"Answer incorrectly presents top product {matching_top} as the lowest-revenue product."
+                    )
+
+        elif effective_intent == "top":
+            # Top-revenue verification: must match maximum revenue product
+            if ans_claims_lowest and not (observed_lowest_products and any(lp in ans_lower for lp in observed_lowest_products)):
+                contradictions.append(
+                    "Answer claims a product as lowest revenue, contradicting the highest/top revenue intent."
+                )
+
+            if observed_top_products:
+                matching_top = [tp for tp in observed_top_products if tp in ans_lower]
+                if matching_top:
+                    verified_claims.append(f"Correctly identified top product: {matching_top}")
+                else:
+                    if mentioned_products:
+                        contradictions.append(
+                            f"Answer asserts product(s) {mentioned_products} as top product, but actual top product in evidence is {list(observed_top_products)}."
+                        )
+                    else:
+                        unsupported_claims.append(
+                            f"Failed to identify verified top product: {list(observed_top_products)}"
+                        )
+
+            # Check if lowest product was mistakenly presented as top
+            if observed_lowest_products and not any(tp in ans_lower for tp in observed_top_products):
+                matching_lowest = [lp for lp in observed_lowest_products if lp in ans_lower]
+                if matching_lowest:
+                    contradictions.append(
+                        f"Answer incorrectly presents lowest-revenue product {matching_lowest} as the top-revenue product."
+                    )
+
+        elif effective_intent == "total_revenue":
+            # Total revenue verification: do NOT enforce top or lowest product condition
+            if mentioned_products:
+                verified_claims.append(f"Correctly referenced context product(s): {mentioned_products}")
+
+        elif effective_intent == "specific_product":
+            target = target_product or (q_prods[0] if q_prods else (mentioned_products[0] if mentioned_products else None))
+            if not target:
+                unsupported_claims.append("Unable to determine requested product from query or candidate answer.")
+            else:
+                # 1. Product reference check
+                if target.lower() in ans_lower:
+                    verified_claims.append(f"Correctly referenced requested product '{target}'.")
+                else:
+                    unsupported_claims.append(f"Answer does not mention requested product '{target}'.")
+
+                # 2. Check observations for target product
+                target_in_evidence = target.lower() in product_revenues
+                target_revenue = product_revenues.get(target.lower())
+
+                # Determine observed period scope
+                observed_start = None
+                observed_end = None
+                for obs in evidence.raw_observations:
+                    args = obs.get("tool_args", {})
+                    if args.get("start_date") or args.get("end_date"):
+                        observed_start = args.get("start_date")
+                        observed_end = args.get("end_date")
+                        break
+                is_filtered_period = bool(observed_start or observed_end)
+                period_label = f"between {observed_start} and {observed_end}" if (observed_start and observed_end) else "the observed period"
+                if "october" in q_lower:
+                    period_label = "October 2024"
+
+                if target_in_evidence and target_revenue is not None and target_revenue > 0:
+                    # Target product has verified positive revenue
+                    if any(abs(round(target_revenue, 2) - round(n, 2)) <= 1.0 for n in extracted_nums):
+                        verified_claims.append(f"Verified revenue figure for '{target}': ${target_revenue:,.2f}")
+                    else:
+                        unsupported_claims.append(
+                            f"Answer does not state the verified revenue for '{target}' (${target_revenue:,.2f})."
+                        )
+                else:
+                    # Target product was NOT found in observation (0 records / $0 revenue)
+                    positive_revenue_claimed = any(
+                        n > 10.0 for n in extracted_nums
+                        if not any(abs(round(n, 2) - obs_n) <= 1.0 for obs_n in observed_numbers)
+                    )
+                    if positive_revenue_claimed:
+                        contradictions.append(
+                            f"Answer asserts positive revenue for '{target}', but tool observations show 0 sales records and $0.00 revenue in {period_label}."
+                        )
+
+                    # Check if answer accurately reports no sales / 0 orders / $0.00 revenue
+                    ans_states_no_sales = bool(
+                        re.search(
+                            r'\b(no (?:sales|orders|records)|0 (?:orders|sales|records|units)|\$0(?:\.00)?|zero (?:revenue|orders|sales|dollars)|not (?:found|present|listed|recorded|included|appear)|absent from (?:the\s+)?(?:observation|october|september|november))\b',
+                            ans_lower
+                        )
+                    )
+                    if ans_states_no_sales or any(abs(n) <= 0.01 for n in extracted_nums):
+                        verified_claims.append(
+                            f"Verified that '{target}' has no sales records in {period_label} ($0.00 total revenue)."
+                        )
+                        observed_numbers[0.0] = f"Zero revenue for {target}"
+                    else:
+                        unsupported_claims.append(
+                            f"Answer does not clearly explain that '{target}' has 0 sales records ($0.00 revenue) in {period_label}."
+                        )
+
+                    # 3. Check for dataset-wide overclaim (Requirement 3 & 4)
+                    claims_dataset_wide_absence = bool(
+                        re.search(
+                            r'\b(does not exist in|absent from|not in|nowhere in|not found in)\b[^\.\n;]{0,40}\b(dataset|database|csv)\b',
+                            ans_lower
+                        ) or any(
+                            phrase in ans_lower
+                            for phrase in [
+                                "entire dataset", "entire database", "entire csv",
+                                "underlying dataset", "underlying database",
+                                "whole dataset", "whole database",
+                            ]
+                        )
+                    )
+                    has_unfiltered_query = any(
+                        (not obs.get("tool_args", {}).get("start_date") and not obs.get("tool_args", {}).get("end_date"))
+                        for obs in evidence.raw_observations
+                    )
+                    if claims_dataset_wide_absence and not has_unfiltered_query and is_filtered_period:
+                        unsupported_claims.append(
+                            f"Answer asserts '{target}' does not exist in the entire dataset, but tool observations only covered a filtered period ({period_label}). "
+                            f"The evidence confirms absence from {period_label}, but does not ground absence from the entire dataset."
+                        )
+
+        elif effective_intent == "ranking":
+            is_ascending = any(phrase in q_lower for phrase in ["lowest to highest", "least to most", "ascending", "bottom to top"])
+            direction_str = "ascending (lowest to highest)" if is_ascending else "descending (highest to lowest)"
+            expected_order = list(reversed(ranked_products)) if is_ascending else list(ranked_products)
+
+            if q_prods and len(q_prods) >= 2:
+                missing_targets = [p for p in q_prods if p.lower() not in ans_lower]
+                if missing_targets:
+                    unsupported_claims.append(
+                        f"Answer is missing requested product(s) for ranking: {[p.title() for p in missing_targets]}."
+                    )
+
+            if len(mentioned_products) >= 2 and ranked_products:
+                indices = []
+                for p in ranked_products:
+                    if p in ans_lower:
+                        indices.append((ans_lower.find(p), expected_order.index(p), p))
+                indices.sort(key=lambda x: x[0])
+                actual_order = [x[1] for x in indices]
+                if actual_order != sorted(actual_order):
+                    contradictions.append(
+                        f"Product ranking order in answer ({[x[2].title() for x in indices]}) contradicts the requested {direction_str} order."
+                    )
+                else:
+                    verified_claims.append(
+                        f"Verified ranking order matches requested {direction_str} order: {[x[2].title() for x in indices]}."
+                    )
+            elif len(mentioned_products) < 2 and (q_prods and len(q_prods) >= 2 or len(ranked_products) >= 2):
+                contradictions.append(
+                    f"Answer only provides a single product ({mentioned_products}) when a ranking comparison was requested."
+                )
+
+        else:
+            # General / conversational with products mentioned
+            if ans_claims_top and observed_top_products and not any(tp in ans_lower for tp in observed_top_products):
+                contradictions.append(
+                    f"Answer claims product(s) {mentioned_products} as top product, but actual top product in evidence is {list(observed_top_products)}."
+                )
+            elif ans_claims_lowest and observed_lowest_products and not any(lp in ans_lower for lp in observed_lowest_products):
+                contradictions.append(
+                    f"Answer claims product(s) {mentioned_products} as lowest-revenue product, but actual lowest-revenue product in evidence is {list(observed_lowest_products)}."
+                )
+            elif mentioned_products:
+                verified_claims.append(f"Correctly referenced subject product(s): {mentioned_products}")
+
+        # Check period consistency
+        months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+        evidence_periods_str = " ".join([f.subject.lower() for f in evidence.facts] + [str(obs).lower() for obs in evidence.raw_observations])
+        answer_months = [m for m in months if m in ans_lower]
+        for m in answer_months:
+            m_num = f"{months.index(m) + 1:02d}"
+            month_in_evidence = (
+                (m in evidence_periods_str)
+                or (f"-{m_num}-" in evidence_periods_str)
+                or (f"-{m_num}" in evidence_periods_str)
+                or (f"{m_num}/" in evidence_periods_str)
+            )
+            if not month_in_evidence:
+                unsupported_claims.append(
+                    f"Answer references period '{m.title()}', which has no supporting tool observations in evidence."
+                )
 
         # 4. Check Percentage Claims against Ground Truth
         extracted_pcts = cls._extract_percentages(candidate_answer)
@@ -231,26 +733,31 @@ class AnswerVerifier:
                 )
 
         # 6. Overall Verification Decision
-        has_critical_failures = bool(contradictions or unsupported_claims)
-        total_claims = len(verified_claims) + len(unsupported_claims) + len(contradictions)
-        confidence = (
-            round(len(verified_claims) / total_claims, 2)
-            if total_claims > 0
-            else 0.0
-        )
-
-        is_verified = (not has_critical_failures) and (len(verified_claims) >= 1)
+        has_critical_failures = bool(contradictions or unsupported_claims or missing_evidence)
+        total_claims = len(verified_claims) + len(unsupported_claims) + len(contradictions) + len(missing_evidence)
+        if has_critical_failures or total_claims == 0:
+            confidence = 0.0
+            is_verified = False
+        else:
+            confidence = (
+                round(len(verified_claims) / total_claims, 2)
+                if total_claims > 0
+                else 0.0
+            )
+            is_verified = len(verified_claims) >= 1
 
         if is_verified:
             explanation = "All key entities, metrics, and numerical figures are grounded and verified against MCP tool observations."
             feedback = None
         else:
-            explanation = "Answer failed grounding verification due to contradictions or unsupported numbers."
+            explanation = "Answer failed grounding verification due to contradictions, incomplete information, or unsupported numbers."
             feedback_parts = []
             if contradictions:
                 feedback_parts.append("Contradictions detected: " + "; ".join(contradictions))
             if unsupported_claims:
                 feedback_parts.append("Unsupported claims: " + "; ".join(unsupported_claims))
+            if missing_evidence:
+                feedback_parts.append("Missing information: " + "; ".join(missing_evidence))
             feedback_parts.append("Established ground-truth facts:\n" + evidence.get_summary_text())
             feedback_parts.append("Please revise the answer to use only the exact ground-truth facts above.")
             feedback = "\n".join(feedback_parts)
@@ -261,7 +768,7 @@ class AnswerVerifier:
             verified_claims=verified_claims,
             unsupported_claims=unsupported_claims,
             contradictions=contradictions,
-            missing_evidence=[],
+            missing_evidence=missing_evidence,
             recalculated_metrics=recalculated,
             feedback_for_correction=feedback,
             explanation=explanation,

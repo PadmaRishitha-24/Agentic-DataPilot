@@ -91,6 +91,58 @@ def get_sales_data(
             "total_records": 0,
         }
 
+    # Validate product filter format if provided
+    if product is not None:
+        if isinstance(product, (list, tuple, set, dict)):
+            return {
+                "status": "error",
+                "error_type": "InvalidProductFilter",
+                "message": (
+                    f"Product filter must be a single string, but received {type(product).__name__}: {product}. "
+                    "To analyze or rank all products, leave product empty."
+                ),
+                "records": [],
+                "total_records": 0,
+            }
+        product_str = str(product).strip()
+        if (product_str.startswith("[") and product_str.endswith("]")) or (product_str.startswith("(") and product_str.endswith(")")):
+            return {
+                "status": "error",
+                "error_type": "InvalidProductFilter",
+                "message": (
+                    f"Product filter must be a single string, but received a list representation: '{product_str}'. "
+                    "To analyze or rank all products, leave product empty."
+                ),
+                "records": [],
+                "total_records": 0,
+            }
+
+        prod_clean = product_str.lower().strip()
+        analytical_terms = {
+            "lowest_revenue_product", "highest_revenue_product", "top_product", "lowest_product",
+            "bottom_product", "best_product", "most_revenue_product", "least_revenue_product",
+            "all_products", "all products", "all", "rank_all_products", "rank all products",
+            "all_product", "every_product", "products", "everything",
+        }
+        if (
+            prod_clean in analytical_terms
+            or any(term in prod_clean for term in [
+                "lowest_revenue", "highest_revenue", "top_product", "lowest_product",
+                "all_product", "all product", "rank_all", "rank all"
+            ])
+        ):
+            return {
+                "status": "error",
+                "error_type": "InvalidProductFilter",
+                "message": (
+                    f"'{product}' is an analytical operation or aggregate request, not a literal product name. "
+                    "To rank all products, analyze all products, or find the lowest/highest revenue product, "
+                    "leave product empty (omit product filter) and call calculate_metrics."
+                ),
+                "records": [],
+                "total_records": 0,
+            }
+
     # Parse and validate CSV
     records: List[Dict[str, Any]] = []
     try:
@@ -263,6 +315,8 @@ def calculate_metrics(
 
     top_product = rankings[0]["product"] if rankings else None
     top_product_revenue = rankings[0]["total_revenue"] if rankings else 0.0
+    lowest_product = rankings[-1]["product"] if rankings else None
+    lowest_product_revenue = rankings[-1]["total_revenue"] if rankings else 0.0
 
     return {
         "status": "success",
@@ -273,6 +327,8 @@ def calculate_metrics(
         "product_rankings": rankings,
         "top_product": top_product,
         "top_product_revenue": top_product_revenue,
+        "lowest_product": lowest_product,
+        "lowest_product_revenue": lowest_product_revenue,
     }
 
 

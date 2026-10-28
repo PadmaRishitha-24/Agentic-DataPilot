@@ -33,7 +33,7 @@ server = MCPServer(
 
 @server.tool(
     name="get_sales_data",
-    description="Read and filter sales records from the local CSV file by optional date range (YYYY-MM-DD) and product name.",
+    description="Read and filter raw unaggregated sales records from the local CSV file by optional date range (YYYY-MM-DD) and a single product name. For grouped product totals or rankings, use calculate_metrics.",
 )
 def get_sales_data(
     csv_path: Optional[str] = None,
@@ -60,7 +60,7 @@ def get_sales_data(
 
 @server.tool(
     name="calculate_metrics",
-    description="Calculate deterministic sales metrics including total revenue, order count, total units sold, and product rankings.",
+    description="Calculate deterministic sales metrics including total revenue, order count, total units sold, and full product rankings (identifying both top and lowest revenue products). Leave product empty to rank all products.",
 )
 def calculate_metrics(
     csv_path: Optional[str] = None,

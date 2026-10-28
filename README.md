@@ -223,7 +223,7 @@ Execute all 43 unit, integration, decision, verification, and reliability tests:
 # Or after activating the venv:
 pytest -v
 ```
-**Expected Output:** `43 passed in ~16s`.
+**Expected Output:** `91 passed in ~32s`.
 
 ---
 

@@ -45,12 +45,31 @@ class EvidenceRecord:
             return
 
         if tool_name == "calculate_metrics":
-            top_prod = tool_result.get("top_product")
-            top_rev = tool_result.get("top_product_revenue")
-            tot_rev = tool_result.get("total_revenue")
+            prod_filter = tool_args.get("product")
+            records_count = tool_result.get("total_records", 0)
             start = tool_args.get("start_date", "all")
             end = tool_args.get("end_date", "all")
             period_key = f"{start}_to_{end}"
+
+            # If a specific product filter was provided and returned zero records:
+            # record that this product had 0 records / $0 revenue in this period.
+            # Do NOT record period-wide total_revenue = 0.0.
+            if prod_filter and records_count == 0:
+                self.facts.append(
+                    GroundTruthFact(
+                        fact_type="product_zero_records",
+                        subject=str(prod_filter),
+                        numeric_value=0.0,
+                        string_value=str(prod_filter),
+                        source_tool="calculate_metrics",
+                        details={"period": period_key, "records": 0, "revenue": 0.0},
+                    )
+                )
+                return
+
+            top_prod = tool_result.get("top_product")
+            top_rev = tool_result.get("top_product_revenue")
+            tot_rev = tool_result.get("total_revenue")
 
             if top_prod:
                 self.known_products.add(top_prod)
@@ -66,14 +85,55 @@ class EvidenceRecord:
                     )
                 )
 
-            if tot_rev is not None:
+            low_prod = tool_result.get("lowest_product")
+            low_rev = tool_result.get("lowest_product_revenue")
+            if not low_prod and tool_result.get("product_rankings"):
+                rankings = tool_result.get("product_rankings", [])
+                if rankings:
+                    low_prod = rankings[-1].get("product")
+                    low_rev = rankings[-1].get("total_revenue")
+
+            if low_prod:
+                self.known_products.add(low_prod)
+                self.facts.append(
+                    GroundTruthFact(
+                        fact_type="lowest_product",
+                        subject=period_key,
+                        string_value=low_prod,
+                        numeric_value=float(low_rev) if low_rev is not None else None,
+                        source_tool="calculate_metrics",
+                        details={"start_date": start, "end_date": end, "revenue": low_rev},
+                    )
+                )
+
+            # Only record period-wide total_revenue if NO product filter was applied
+            if not prod_filter and tot_rev is not None and records_count > 0:
                 self.facts.append(
                     GroundTruthFact(
                         fact_type="total_revenue",
                         subject=period_key,
                         numeric_value=float(tot_rev),
                         source_tool="calculate_metrics",
+                        details={"start_date": start, "end_date": end, "record_count": records_count},
+                    )
+                )
+                self.facts.append(
+                    GroundTruthFact(
+                        fact_type="order_count",
+                        subject=period_key,
+                        numeric_value=float(records_count),
+                        source_tool="calculate_metrics",
                         details={"start_date": start, "end_date": end},
+                    )
+                )
+            elif prod_filter and tot_rev is not None and records_count > 0:
+                self.facts.append(
+                    GroundTruthFact(
+                        fact_type="product_revenue",
+                        subject=str(prod_filter),
+                        numeric_value=float(tot_rev),
+                        source_tool="calculate_metrics",
+                        details={"period": period_key},
                     )
                 )
 
@@ -166,20 +226,47 @@ class EvidenceRecord:
                 p = r.get("product")
                 if p:
                     self.known_products.add(p)
-            if records:
-                tot_rev = sum(float(r.get("revenue", 0.0)) for r in records)
+            prod_filter = tool_args.get("product")
+            if prod_filter and not records:
                 start = tool_args.get("start_date", "all")
                 end = tool_args.get("end_date", "all")
                 period_key = f"{start}_to_{end}"
                 self.facts.append(
                     GroundTruthFact(
-                        fact_type="total_revenue",
-                        subject=period_key,
-                        numeric_value=round(tot_rev, 2),
+                        fact_type="product_zero_records",
+                        subject=str(prod_filter),
+                        numeric_value=0.0,
+                        string_value=str(prod_filter),
                         source_tool="get_sales_data",
-                        details={"record_count": len(records)},
+                        details={"period": period_key, "records": 0, "revenue": 0.0},
                     )
                 )
+                return
+
+            if records:
+                tot_rev = sum(float(r.get("revenue", 0.0)) for r in records)
+                start = tool_args.get("start_date", "all")
+                end = tool_args.get("end_date", "all")
+                period_key = f"{start}_to_{end}"
+                if not prod_filter:
+                    self.facts.append(
+                        GroundTruthFact(
+                            fact_type="total_revenue",
+                            subject=period_key,
+                            numeric_value=round(tot_rev, 2),
+                            source_tool="get_sales_data",
+                            details={"record_count": len(records)},
+                        )
+                    )
+                    self.facts.append(
+                        GroundTruthFact(
+                            fact_type="order_count",
+                            subject=period_key,
+                            numeric_value=float(len(records)),
+                            source_tool="get_sales_data",
+                            details={"start_date": start, "end_date": end},
+                        )
+                    )
                 prod_totals: Dict[str, float] = {}
                 for r in records:
                     p = r.get("product")
@@ -187,6 +274,7 @@ class EvidenceRecord:
                         prod_totals[p] = prod_totals.get(p, 0.0) + float(r.get("revenue", 0.0))
                 if prod_totals:
                     top_p = max(prod_totals, key=prod_totals.get)
+                    lowest_p = min(prod_totals, key=prod_totals.get)
                     self.top_products_by_period[period_key] = top_p
                     self.facts.append(
                         GroundTruthFact(
@@ -196,6 +284,16 @@ class EvidenceRecord:
                             numeric_value=round(prod_totals[top_p], 2),
                             source_tool="get_sales_data",
                             details={"revenue": round(prod_totals[top_p], 2)},
+                        )
+                    )
+                    self.facts.append(
+                        GroundTruthFact(
+                            fact_type="lowest_product",
+                            subject=period_key,
+                            string_value=lowest_p,
+                            numeric_value=round(prod_totals[lowest_p], 2),
+                            source_tool="get_sales_data",
+                            details={"revenue": round(prod_totals[lowest_p], 2)},
                         )
                     )
                     for prod_name, p_rev in prod_totals.items():
@@ -211,17 +309,35 @@ class EvidenceRecord:
 
     def get_summary_text(self) -> str:
         """Return formatted bullet points of established ground truth facts."""
-        if not self.facts:
+        if not self.facts and not self.raw_observations:
             return "No verified facts established yet."
 
         lines = []
         for f in self.facts:
             if f.fact_type == "top_product":
                 lines.append(f"- Top product for {f.subject}: '{f.string_value}' (${f.numeric_value:,.2f})")
+            elif f.fact_type == "lowest_product":
+                lines.append(f"- Lowest revenue product for {f.subject}: '{f.string_value}' (${f.numeric_value:,.2f})")
             elif f.fact_type == "product_revenue":
                 lines.append(f"- Revenue for '{f.subject}' in {f.details.get('period', 'period')}: ${f.numeric_value:,.2f}")
             elif f.fact_type == "percentage_growth":
                 lines.append(f"- Growth for '{f.subject}': {f.numeric_value:+.2f}% (Absolute: ${f.details.get('absolute_change', 0):+,.2f})")
             elif f.fact_type == "total_revenue":
                 lines.append(f"- Total revenue for {f.subject}: ${f.numeric_value:,.2f}")
+            elif f.fact_type == "product_zero_records":
+                lines.append(f"- No sales records found for product '{f.subject}' in {f.details.get('period', 'period')} ($0.00 revenue across 0 orders)")
+
+        # Include structured complete ranking if present in observations
+        for obs in self.raw_observations:
+            if obs.get("tool_name") == "calculate_metrics":
+                res = obs.get("tool_result", {})
+                rankings = res.get("product_rankings")
+                if rankings:
+                    ranking_bullets = [
+                        f"  {idx+1}. {item.get('product')}: ${item.get('total_revenue', 0.0):,.2f}"
+                        for idx, item in enumerate(rankings)
+                    ]
+                    lines.append("- Complete Product Rankings (Highest to Lowest):\n" + "\n".join(ranking_bullets))
+                    break
+
         return "\n".join(lines)
